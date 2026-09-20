@@ -1,0 +1,9 @@
+#!/bin/bash
+
+. ./MyUtLib.sh
+
+echo "ttt"
+
+banner_show
+echo -e "${RED} bye! ${RESET}"
+
