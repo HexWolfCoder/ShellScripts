@@ -1,0 +1,216 @@
+#!/bin/bash
+# webmon.sh — мониторинг веб-серверов с интерфейсом dialog
+# Использование: ./webmon.sh
+# Зависимости: dialog, curl
+
+set -u
+
+CONFIG_DIR="${HOME}/.webmon"
+URLS_FILE="${CONFIG_DIR}/urls.txt"
+LOG_FILE="${CONFIG_DIR}/webmon.log"
+CHECK_INTERVAL=30           
+CURL_TIMEOUT=30            
+
+mkdir -p "$CONFIG_DIR"
+touch "$URLS_FILE" "$LOG_FILE"
+
+run_dialog() {
+    dialog "$@" 3>&1 1>&2 2>&3
+}
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+check_url() {
+    local url="$1"
+    local body http_code time_total content_type
+
+    body=$(curl -sS -L --max-time "$CURL_TIMEOUT" \
+                -o /tmp/webmon_body.$$ \
+                -w '%{http_code}|%{time_total}|%{content_type}' \
+                "$url" 2>/dev/null)
+    local rc=$?
+
+    if [ $rc -ne 0 ]; then
+        echo "FAIL|000|0|curl_error_$rc"
+        return 1
+    fi
+
+    IFS='|' read -r http_code time_total content_type <<< "$body"
+
+    if [ "$http_code" = "200" ] && [[ "$content_type" == *html* ]]; then
+        echo "OK|${http_code}|${time_total}|${content_type}"
+        return 0
+    fi
+
+    local reason=""
+    [ "$http_code" != "200" ] && reason="http_${http_code}"
+    [[ "$content_type" != *html* ]] && reason="${reason:+${reason}_}not_html"
+    echo "FAIL|${http_code}|${time_total}|${reason:-unknown}"
+    return 1
+}
+add_url() {
+    local url
+    url=$(run_dialog --title "Добавить URL" \
+                     --inputbox "Введите URL (например, https://example.com):" \
+                     10 60 "https://") || return
+
+    [ -z "$url" ] && return
+
+    if [[ ! "$url" =~ ^https?:// ]]; then
+        dialog --msgbox "URL должен начинаться с http:// или https://" 8 60
+        return
+    fi
+
+    if grep -qxF "$url" "$URLS_FILE"; then
+        dialog --msgbox "Такой URL уже есть в списке." 8 60
+        return
+    fi
+
+    echo "$url" >> "$URLS_FILE"
+    log "ADD $url"
+    dialog --msgbox "Добавлено: $url" 8 60
+}
+
+remove_url() {
+    [ ! -s "$URLS_FILE" ] && { dialog --msgbox "Список пуст." 8 40; return; }
+
+    local args=()
+    local i=1
+    while IFS= read -r url; do
+        args+=("$i" "$url")
+        ((i++))
+    done < "$URLS_FILE"
+
+    local choice
+    choice=$(run_dialog --title "Удалить URL" \
+                        --menu "Выберите запись для удаления:" \
+                        20 70 10 "${args[@]}") || return
+
+    sed -i "${choice}d" "$URLS_FILE"
+    log "REMOVE line $choice"
+    dialog --msgbox "Удалено." 8 40
+}
+
+list_urls() {
+    if [ ! -s "$URLS_FILE" ]; then
+        dialog --msgbox "Список пуст." 8 40
+        return
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    nl -w2 -s'. ' "$URLS_FILE" > "$tmp"
+    dialog --title "Список URL" --textbox "$tmp" 20 70
+    rm -f "$tmp"
+}
+
+monitor_loop() {
+    if [ ! -s "$URLS_FILE" ]; then
+        dialog --msgbox "Сначала добавьте хотя бы один URL." 8 50
+        return
+    fi
+
+    local stop=0
+    trap 'stop=1' INT TERM
+
+    log "=== MONITOR START ==="
+
+    while [ $stop -eq 0 ]; do
+        local output=""
+        local total=0 ok=0 fail=0
+
+        while IFS= read -r url; do
+            ((total++))
+            local result
+            result=$(check_url "$url")
+            local rc=$?
+
+            IFS='|' read -r status code time reason <<< "$result"
+
+            if [ $rc -eq 0 ]; then
+                ((ok++))
+                output+="[ OK ]  ${url}\n"
+                output+="       HTTP ${code}  |  ${time}s\n\n"
+                log "OK   $url HTTP=$code time=$time"
+            else
+                ((fail++))
+                output+="[FAIL] ${url}\n"
+                output+="       HTTP ${code}  |  ${time}s  |  ${reason}\n\n"
+                log "FAIL $url HTTP=$code time=$time reason=$reason"
+            fi
+        done < "$URLS_FILE"
+
+        local header
+        header=$(printf 'Обновлено: %s\nВсего: %d  |  OK: %d  |  FAIL: %d\nИнтервал: %ds  |  Ctrl+C — выход\n%s\n' \
+                 "$(date '+%H:%M:%S')" "$total" "$ok" "$fail" "$CHECK_INTERVAL" \
+                 "$(printf '─%.0s' {1..60})")
+
+        dialog --title "Мониторинг веб-серверов" \
+               --infobox "${header}\n\n${output}" \
+               20 70
+
+        local waited=0
+        while [ $waited -lt $CHECK_INTERVAL ] && [ $stop -eq 0 ]; do
+            sleep 1
+            ((waited++))
+        done
+    done
+
+    trap - INT TERM
+    log "=== MONITOR STOP ==="
+    dialog --msgbox "Мониторинг остановлен." 8 40
+}
+
+view_log() {
+    if [ ! -s "$LOG_FILE" ]; then
+        dialog --msgbox "Лог пуст." 8 40
+        return
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    tail -n 500 "$LOG_FILE" > "$tmp"
+    dialog --title "Лог (последние 500 строк)" --textbox "$tmp" 25 80
+    rm -f "$tmp"
+}
+
+main_menu() {
+    while true; do
+        local choice
+        choice=$(run_dialog --title "WebMon" \
+                            --backtitle "Мониторинг веб-серверов" \
+                            --menu "Выберите действие:" \
+                            18 60 7 \
+                            "1" "Запустить мониторинг" \
+                            "2" "Добавить URL" \
+                            "3" "Удалить URL" \
+                            "4" "Показать список URL" \
+                            "5" "Показать лог" \
+                            "6" "Очистить лог" \
+                            "7" "Выход") || break   
+
+        case "$choice" in
+            1) monitor_loop ;;
+            2) add_url ;;
+            3) remove_url ;;
+            4) list_urls ;;
+            5) view_log ;;
+            6) : > "$LOG_FILE"; dialog --msgbox "Лог очищен." 8 40 ;;
+            7) break ;;
+        esac
+    done
+
+    clear
+}
+
+
+for cmd in dialog curl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Ошибка: не найдена команда '$cmd'. Установите её." >&2
+        exit 1
+    fi
+done
+
+main_menu
