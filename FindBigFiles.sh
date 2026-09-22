@@ -1,5 +1,5 @@
 #!/bin/bash
-# find_big_files.sh — поиск файлов больше 1 Гб
+# find_big_files.sh — search files great then 1 Gb
 # use: ./find_big_files.sh [directory]
 
 . ./MyUtLib.sh
